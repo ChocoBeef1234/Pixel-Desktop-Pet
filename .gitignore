@@ -1,5 +1,7 @@
-# Sprite pack is licensed for use only, not redistribution - add it locally.
-assets/*
-!assets/.gitkeep
+# Characters you add stay on your PC; only the example ships with the repo.
+characters/*
+!characters/slime_buddy/
+
+settings.json
 __pycache__/
 *.pyc

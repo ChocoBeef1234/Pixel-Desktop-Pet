@@ -1,53 +1,53 @@
 """
 Meow Knight desktop pet.
 
-A little knight cat that lives on top of your taskbar.
-  - Wanders, jumps, rolls and practises sword swings on its own
-  - Slimes drop in now and then; the knight hunts them down
-  - Left-click the cat: it swings its sword (or wakes up if napping)
+A little character that lives on top of your taskbar.
+  - Wanders, jumps, rolls and practises attacks on its own
+  - Slimes drop in now and then; your character hunts them down
+  - Left-click the character: it attacks (or wakes up if napping)
   - Left-click a slime: squish it yourself
-  - Drag the cat: pick it up; let go to drop / toss it
-  - Right-click the cat: menu (jump, nap, spawn monster, size, quit)
+  - Drag the character: pick it up; let go to drop / toss it
+  - Right-click the character: menu (character, jump, nap, monsters, size, quit)
   - Falls asleep when you stop using the computer for a while
 
+Characters live in the "characters" folder. See CHARACTERS.md to add your own.
 Double-click this .pyw file to run without a console window.
 """
 import ctypes
+import json
 import math
 import os
 import random
+import re
+import shutil
+import sys
 import time
 import tkinter as tk
+from tkinter import filedialog, messagebox
 
 from PIL import Image, ImageOps, ImageTk
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-ASSETS = os.path.join(HERE, "assets")
+sys.path.insert(0, HERE)
+from character import (MANIFEST, Character, looks_like_character,  # noqa: E402
+                       read_display_name)
 
-KEY = "#010203"          # transparent color key (never appears in the sprites)
+CHAR_DIR = os.path.join(HERE, "characters")
+SETTINGS_FILE = os.path.join(HERE, "settings.json")
+DEFAULT_CHARACTER = "meow_knight"
+
+KEY = "#010203"          # transparent color key
 KEY_RGB = (1, 2, 3)
 TICK_MS = 30
-SLEEP_AFTER_IDLE_S = 180  # user inactivity before the cat naps
-DEFAULT_SCALE = 3
+SLEEP_AFTER_IDLE_S = 180  # user inactivity before the character naps
+
+# On-screen height of the idle pose for each size option.
+SIZES = (("Small", 30), ("Medium", 45), ("Large", 60), ("Huge", 90))
+DEFAULT_SIZE = "Medium"
 
 FIRST_SPAWN_S = (10, 25)    # first monster arrives soon after launch
 SPAWN_EVERY_S = (45, 150)   # then every so often
 MAX_MONSTERS = 3
-
-# name: (file, ms per frame)
-ANIMS = {
-    "idle":    ("Meow-Knight_Idle.png", 150),
-    "run":     ("Meow-Knight_Run.png", 95),
-    "jump":    ("Meow-Knight_Jump.png", 80),
-    "dodge":   ("Meow-Knight_Dodge.png", 75),
-    "attack1": ("Meow-Knight_Attack_1.png", 70),
-    "attack2": ("Meow-Knight_Attack_2.png", 95),
-    "attack3": ("Meow-Knight_Attack_3.png", 95),
-    "hurt":    ("Meow-Knight_Take_Damage.png", 110),
-    "death":   ("Meow-Knight_Death.png", 160),
-}
-# Frame on which each attack's blade connects.
-HIT_FRAME = {"attack1": 4, "attack2": 1, "attack3": 1}
 
 user32 = ctypes.windll.user32
 kernel32 = ctypes.windll.kernel32
@@ -97,50 +97,6 @@ def make_overlay(window):
     window.config(bg=KEY)
 
 
-# --------------------------------------------------------------------------- #
-# Sprite helpers
-# --------------------------------------------------------------------------- #
-def load_strip(path, merge_gap=3):
-    """Split a vertical sprite strip into frames using transparent row gaps.
-
-    Returns (frames, anchor_x, sheet_width) where anchor_x is the cat body's
-    horizontal center inside the sheet (so effects don't shift the cat).
-    """
-    im = Image.open(path).convert("RGBA")
-    w, h = im.size
-    a = im.getchannel("A").load()
-    rows = [any(a[x, y] > 0 for x in range(w)) for y in range(h)] + [False]
-
-    segs, start = [], None
-    for y, filled in enumerate(rows):
-        if filled and start is None:
-            start = y
-        elif not filled and start is not None:
-            segs.append([start, y - 1])
-            start = None
-
-    merged = []
-    for s in segs:
-        if merged and s[0] - merged[-1][1] <= merge_gap:
-            merged[-1][1] = s[1]
-        else:
-            merged.append(s)
-
-    frames = [im.crop((0, top, w, bot + 1)) for top, bot in merged]
-
-    # Densest 10px column band across all frames = the cat's body.
-    dens = [0] * w
-    for f in frames:
-        fa = f.getchannel("A").load()
-        for x in range(w):
-            for y in range(f.height):
-                if fa[x, y] > 127:
-                    dens[x] += 1
-    band = min(10, w)
-    best = max(range(w - band + 1), key=lambda i: sum(dens[i:i + band]))
-    return frames, best + band / 2.0, w
-
-
 def key_photo(img):
     """RGBA image -> PhotoImage on the transparent key color (hard edges)."""
     bg = Image.new("RGB", img.size, KEY_RGB)
@@ -149,11 +105,19 @@ def key_photo(img):
     return ImageTk.PhotoImage(bg)
 
 
-def to_photo(img, scale, mirror):
-    img = img.resize((img.width * scale, img.height * scale), Image.NEAREST)
-    if mirror:
-        img = ImageOps.mirror(img)
-    return key_photo(img)
+def list_characters():
+    if not os.path.isdir(CHAR_DIR):
+        return []
+    return sorted(d for d in os.listdir(CHAR_DIR)
+                  if looks_like_character(os.path.join(CHAR_DIR, d)))
+
+
+def load_settings():
+    try:
+        with open(SETTINGS_FILE, encoding="utf-8") as fh:
+            return json.load(fh)
+    except Exception:
+        return {}
 
 
 # --------------------------------------------------------------------------- #
@@ -229,7 +193,7 @@ class Slime:
         self.build()
 
     def build(self):
-        s = max(1, round(self.pet.scale * (1.5 if self.big else 1.0)))
+        s = max(1, round(self.pet.u * (1.5 if self.big else 1.0)))
         base = slime_image(self.colors)
         w, h = base.size
         white = Image.new("RGBA", base.size, (255, 255, 255, 255))
@@ -263,9 +227,9 @@ class Slime:
             return
         self.hp -= 1
         self.flash = 0.16
-        s = self.pet.scale
-        self.vx = direction * 55 * s
-        self.vy = -55 * s
+        u = self.pet.u
+        self.vx = direction * 55 * u
+        self.vy = -55 * u
         self.airborne = True
         self.crouch = 0.0
         if self.hp <= 0:
@@ -280,11 +244,18 @@ class Slime:
         for _ in range(14 if self.big else 10):
             size = random.choice((1, 1, 2)) * self.px_scale
             ang = random.uniform(math.pi * 1.05, math.pi * 1.95)
-            spd = random.uniform(80, 200) * self.pet.scale / 3
+            spd = random.uniform(80, 200) * self.pet.u / 3
             rid = self.canvas.create_rectangle(cx, cy, cx + size, cy + size,
                                                fill=random.choice(colors), width=0)
             self.particles.append([rid, cx, cy, math.cos(ang) * spd,
                                    math.sin(ang) * spd, size])
+
+    def destroy(self):
+        self.gone = True
+        try:
+            self.win.destroy()
+        except tk.TclError:
+            pass
 
     # ---- simulation ------------------------------------------------------ #
     def update(self, dt):
@@ -297,11 +268,10 @@ class Slime:
                 shrink = max(0.0, 1 - self.dead_t / 0.9) * p[5]
                 self.canvas.coords(p[0], p[1], p[2], p[1] + shrink, p[2] + shrink)
             if self.dead_t > 0.9:
-                self.gone = True
-                self.win.destroy()
+                self.destroy()
             return
 
-        s = self.pet.scale
+        u = self.pet.u
         ground = self.pet.ground
         self.t += dt
         self.flash = max(0.0, self.flash - dt)
@@ -322,11 +292,11 @@ class Slime:
             if self.crouch <= 0:
                 dist = self.pet.x - self.x
                 if abs(dist) < 700 and random.random() < 0.7:
-                    direction = 1 if dist > 0 else -1     # creep toward the knight
+                    direction = 1 if dist > 0 else -1     # creep toward the hero
                 else:
                     direction = random.choice((-1, 1))
-                self.vx = direction * random.uniform(25, 45) * s
-                self.vy = -random.uniform(90, 130) * s
+                self.vx = direction * random.uniform(25, 45) * u
+                self.vy = -random.uniform(90, 130) * u
                 self.airborne = True
         else:
             self.hop_timer -= dt
@@ -365,11 +335,11 @@ class Slime:
 # --------------------------------------------------------------------------- #
 # The pet
 # --------------------------------------------------------------------------- #
-class MeowKnight:
+class DesktopPet:
     def __init__(self):
         make_dpi_aware()
         self.root = tk.Tk()
-        self.root.title("Meow Knight")
+        self.root.title("Desktop Pet")
         make_overlay(self.root)
 
         self.canvas = tk.Canvas(self.root, bg=KEY, highlightthickness=0, bd=0)
@@ -378,10 +348,17 @@ class MeowKnight:
         self.z_id = self.canvas.create_text(0, 0, text="", fill="#dfe9ff",
                                             font=("Consolas", 11, "bold"))
 
-        self.raw = {name: load_strip(os.path.join(ASSETS, f))
-                    for name, (f, _) in ANIMS.items()}
-        self.scale = DEFAULT_SCALE
-        self.build_frames()
+        settings = load_settings()
+        self.size_name = settings.get("size", DEFAULT_SIZE)
+        if self.size_name not in dict(SIZES):
+            self.size_name = DEFAULT_SIZE
+        self.char = None
+        self.char_key = None
+        self.char_var = tk.StringVar()
+        self.size_var = tk.StringVar(value=self.size_name)
+        if not self.load_initial_character(settings.get("character")):
+            self.root.destroy()
+            raise SystemExit(1)
 
         left, top, right, bottom = work_area()
         self.ground = bottom
@@ -396,7 +373,6 @@ class MeowKnight:
         self.timer = 0.0
         self.target_x = self.x
         self.nap_until = None
-        self.last_geom = None
         self.last_time = time.perf_counter()
 
         self.press = None
@@ -408,22 +384,10 @@ class MeowKnight:
         self.kills = 0
         self.hit_done = True
         self.spawn_timer = random.uniform(*FIRST_SPAWN_S)
-        self.monsters_on = tk.BooleanVar(value=True)
+        self.monsters_on = tk.BooleanVar(value=settings.get("monsters", True))
 
-        self.menu = tk.Menu(self.root, tearoff=0)
-        self.menu.add_command(label="Slimes defeated: 0", state="disabled")
-        self.kills_index = self.menu.index("end")
-        self.menu.add_separator()
-        self.menu.add_command(label="Jump!", command=lambda: self.start_jump(0))
-        self.menu.add_command(label="Take a nap", command=self.start_nap)
-        self.menu.add_command(label="Spawn a monster", command=self.spawn_monster)
-        self.menu.add_checkbutton(label="Monsters appear", variable=self.monsters_on)
-        size = tk.Menu(self.menu, tearoff=0)
-        for label, s in (("Small", 2), ("Medium", 3), ("Large", 4), ("Huge", 6)):
-            size.add_command(label=label, command=lambda s=s: self.set_scale(s))
-        self.menu.add_cascade(label="Size", menu=size)
-        self.menu.add_separator()
-        self.menu.add_command(label="Goodbye, kitty", command=self.root.destroy)
+        self.build_menu()
+        self.build_frames()
 
         self.canvas.bind("<ButtonPress-1>", self.on_press)
         self.canvas.bind("<B1-Motion>", self.on_drag)
@@ -433,39 +397,174 @@ class MeowKnight:
         self.enter_idle()
         self.root.after(TICK_MS, self.tick)
 
+    # ---- characters ------------------------------------------------------ #
+    def load_initial_character(self, wanted):
+        keys = list_characters()
+        order = [k for k in (wanted, DEFAULT_CHARACTER) if k in keys]
+        order += [k for k in keys if k not in order]
+        errors = []
+        for key in order:
+            try:
+                self.char = Character(os.path.join(CHAR_DIR, key))
+                self.char_key = key
+                self.char_var.set(key)
+                return True
+            except Exception as e:
+                errors.append("%s: %s" % (key, e))
+        os.makedirs(CHAR_DIR, exist_ok=True)
+        messagebox.showerror(
+            "No character",
+            "No usable character was found in:\n%s\n\n%s\n\nAdd a character folder "
+            "(see CHARACTERS.md) and start again." % (CHAR_DIR, "\n".join(errors)))
+        try:
+            os.startfile(CHAR_DIR)
+        except Exception:
+            pass
+        return False
+
+    def switch_character(self, key):
+        try:
+            char = Character(os.path.join(CHAR_DIR, key))
+        except Exception as e:
+            messagebox.showerror("Can't load character", "%s\n\n%s" % (key, e),
+                                 parent=self.root)
+            self.char_var.set(self.char_key)
+            return
+        self.char = char
+        self.char_key = key
+        self.char_var.set(key)
+        self.build_frames()
+        self.enter_idle()
+        self.save_settings()
+
+    def import_character(self):
+        src = filedialog.askdirectory(parent=self.root,
+                                      title="Choose the folder with your character's sprites")
+        if not src:
+            return
+        try:
+            char = Character(src)
+        except Exception as e:
+            messagebox.showerror(
+                "Can't use that folder",
+                "%s\n\nRequirements:\n- At least an idle animation (e.g. idle.png)\n"
+                "- PNG/GIF/WebP sprite sheets, animated GIFs, or folders of frames\n"
+                "- Transparent background\n\nSee CHARACTERS.md for details." % e,
+                parent=self.root)
+            return
+        base = re.sub(r"[^A-Za-z0-9_-]+", "_",
+                      os.path.basename(os.path.normpath(src))).strip("_").lower() or "character"
+        dest, i = os.path.join(CHAR_DIR, base), 2
+        while os.path.exists(dest):
+            dest, i = os.path.join(CHAR_DIR, "%s_%d" % (base, i)), i + 1
+        os.makedirs(dest)
+        for rel in set(char.files_used()):
+            s, d = os.path.join(src, rel), os.path.join(dest, rel)
+            os.makedirs(os.path.dirname(d), exist_ok=True)
+            if os.path.isdir(s):
+                shutil.copytree(s, d)
+            else:
+                shutil.copy2(s, d)
+        mpath = os.path.join(dest, MANIFEST)
+        if char.detected:
+            with open(mpath, "w", encoding="utf-8") as fh:
+                json.dump(char.manifest, fh, indent=2)
+        else:
+            shutil.copy2(os.path.join(src, MANIFEST), mpath)
+        messagebox.showinfo(
+            "Character imported",
+            "%s\n\nTo fine-tune it (speed, facing, frame sizes), edit:\n%s"
+            % (char.summary(), mpath), parent=self.root)
+        self.switch_character(os.path.basename(dest))
+
+    def save_settings(self):
+        try:
+            with open(SETTINGS_FILE, "w", encoding="utf-8") as fh:
+                json.dump({"character": self.char_key, "size": self.size_name,
+                           "monsters": self.monsters_on.get()}, fh, indent=2)
+        except Exception:
+            pass
+
+    # ---- menu ------------------------------------------------------------ #
+    def build_menu(self):
+        self.menu = tk.Menu(self.root, tearoff=0)
+        self.menu.add_command(label="Slimes defeated: 0", state="disabled")
+        self.kills_index = self.menu.index("end")
+        self.menu.add_separator()
+        self.char_menu = tk.Menu(self.menu, tearoff=0, postcommand=self.fill_char_menu)
+        self.menu.add_cascade(label="Character", menu=self.char_menu)
+        self.menu.add_command(label="Jump!", command=lambda: self.start_jump(0))
+        self.menu.add_command(label="Take a nap", command=self.start_nap)
+        self.menu.add_command(label="Spawn a monster", command=self.spawn_monster)
+        self.menu.add_checkbutton(label="Monsters appear", variable=self.monsters_on,
+                                  command=self.save_settings)
+        size = tk.Menu(self.menu, tearoff=0)
+        for label, _ in SIZES:
+            size.add_radiobutton(label=label, variable=self.size_var, value=label,
+                                 command=lambda l=label: self.set_size(l))
+        self.menu.add_cascade(label="Size", menu=size)
+        self.menu.add_separator()
+        self.menu.add_command(label="Goodbye", command=self.root.destroy)
+
+    def fill_char_menu(self):
+        m = self.char_menu
+        m.delete(0, "end")
+        for key in list_characters():
+            m.add_radiobutton(label=read_display_name(os.path.join(CHAR_DIR, key)),
+                              variable=self.char_var, value=key,
+                              command=lambda k=key: self.switch_character(k))
+        m.add_separator()
+        m.add_command(label="Import character folder...", command=self.import_character)
+        m.add_command(label="Open characters folder", command=self.open_char_dir)
+
+    def open_char_dir(self):
+        os.makedirs(CHAR_DIR, exist_ok=True)
+        os.startfile(CHAR_DIR)
+
     # ---- frames ---------------------------------------------------------- #
     def build_frames(self):
-        s = self.scale
-        self.frames = {}
+        c = self.char
+        target = dict(SIZES)[self.size_name]
+        s = target / float(c.body_h)
+        if c.pixel_art and s >= 1:
+            s = max(1, round(s))           # whole-number scaling keeps pixels crisp
+        self.s = s
+        self.u = c.body_h * s / 15.0       # movement unit (1.0 ~ a 15px sprite at 1x)
+        resample = Image.NEAREST if c.pixel_art else Image.LANCZOS
+        src_left = c.facing == "left"
+
+        cache, self.frames = {}, {}
         half_w, max_h = 0, 0
-        for name, (frames, anchor, sheet_w) in self.raw.items():
+        for name, a in c.anims.items():
             out = []
-            for f in frames:
-                out.append({
-                    "r": to_photo(f, s, False),
-                    "l": to_photo(f, s, True),
-                    "h": f.height * s,
-                    "ar": anchor * s,
-                    "al": (sheet_w - anchor) * s,
-                })
-                max_h = max(max_h, f.height * s)
+            for f in a["frames"]:
+                if id(f) not in cache:
+                    size = (max(1, round(f.width * s)), max(1, round(f.height * s)))
+                    img = f.resize(size, resample)
+                    mir = ImageOps.mirror(img)
+                    cache[id(f)] = (key_photo(mir if src_left else img),
+                                    key_photo(img if src_left else mir), size)
+                right, left, (w, h) = cache[id(f)]
+                anchor = a["anchor"] * w / f.width
+                ar = (w - anchor) if src_left else anchor
+                out.append({"r": right, "l": left, "h": h, "ar": ar, "al": w - ar})
+                half_w = max(half_w, ar, w - ar)
+                max_h = max(max_h, h)
             self.frames[name] = out
-            half_w = max(half_w, max(anchor, sheet_w - anchor) * s)
         self.half_w = int(math.ceil(half_w)) + 2
         self.cw = self.half_w * 2
-        self.headroom = 18 * s
-        self.ch = int(max_h + self.headroom)
+        self.ch = int(max_h + 18 * self.u)
         self.canvas.config(width=self.cw, height=self.ch)
         self.last_geom = None
-
-    def set_scale(self, s):
-        self.scale = s
-        self.build_frames()
-        for m in self.monsters:
+        for m in getattr(self, "monsters", []):
             if not m.dead:
                 m.build()
-        if self.anim:
-            self.render()
+
+    def set_size(self, label):
+        self.size_name = label
+        self.size_var.set(label)
+        self.build_frames()
+        self.save_settings()
 
     # ---- animation ------------------------------------------------------- #
     def play(self, name, loop=False, seq=None):
@@ -477,7 +576,7 @@ class MeowKnight:
             "t": 0.0,
             "loop": loop,
             "done": False,
-            "ms": ANIMS[name][1],
+            "ms": self.char.anims[name]["ms"],
         }
 
     def advance(self, dt):
@@ -485,8 +584,11 @@ class MeowKnight:
         if a["done"]:
             return
         a["t"] += dt * 1000
-        while a["t"] >= a["ms"]:
-            a["t"] -= a["ms"]
+        while True:
+            ms = max(10.0, a["ms"][a["seq"][a["pos"]]])
+            if a["t"] < ms:
+                break
+            a["t"] -= ms
             if a["pos"] + 1 < len(a["seq"]):
                 a["pos"] += 1
             elif a["loop"]:
@@ -509,7 +611,7 @@ class MeowKnight:
     def spawn_monster(self):
         left, _, right, _ = work_area()
         x = random.uniform(left + 80, right - 80)
-        for _ in range(12):  # prefer somewhere not right on top of the cat
+        for _ in range(12):  # prefer somewhere not right on top of the hero
             if abs(x - self.x) > 250:
                 break
             x = random.uniform(left + 80, right - 80)
@@ -535,16 +637,19 @@ class MeowKnight:
                 m.render()
         self.monsters = [m for m in self.monsters if not m.gone]
 
+    def reach(self):
+        return self.char.attack_reach * self.s
+
     def check_hit(self):
         a = self.anim
-        hit_at = HIT_FRAME.get(a["name"])
-        if self.hit_done or hit_at is None or a["pos"] < hit_at:
+        if self.hit_done or a["name"] not in self.char.attacks:
+            return
+        if a["pos"] < self.char.anims[a["name"]].get("hit_frame", 0) and not a["done"]:
             return
         self.hit_done = True
-        reach = 22 * self.scale
         for m in self.live_monsters():
             dx = m.x - self.x
-            if abs(dx) - m.half_w <= reach and dx * self.facing >= -m.half_w:
+            if abs(dx) - m.half_w <= self.reach() and dx * self.facing >= -m.half_w:
                 m.hit(self.facing)
 
     # ---- states ---------------------------------------------------------- #
@@ -557,6 +662,7 @@ class MeowKnight:
         self.play("idle", loop=True)
         self.timer = random.uniform(min_s, max_s)
         self.feet_y = self.ground
+        self.vx = 0.0
         self.canvas.itemconfig(self.z_id, text="")
 
     def enter_hunt(self):
@@ -598,24 +704,27 @@ class MeowKnight:
     def start_jump(self, direction):
         self.set_state("jump")
         self.play("jump")
-        self.vx = direction * 70 * self.scale
+        self.vx = direction * 70 * self.u
 
     def start_attack(self):
         self.set_state("attack")
-        self.play(random.choice(("attack1", "attack2", "attack3")))
+        self.play(random.choice(self.char.attacks))
         self.hit_done = False
 
     def start_nap(self, seconds=None):
         self.feet_y = self.ground
         self.set_state("sleep")
-        self.play("death")
+        self.play("sleep", loop=self.char.sleep_loops)
         self.nap_until = (time.monotonic() + seconds) if seconds else None
 
     def start_wake(self):
-        self.set_state("wake")
-        n = len(self.frames["death"])
-        self.play("death", seq=range(n - 1, -1, -1))
         self.canvas.itemconfig(self.z_id, text="")
+        if self.char.sleep_loops:
+            self.enter_idle()
+            return
+        self.set_state("wake")
+        n = len(self.frames["sleep"])
+        self.play("sleep", seq=range(n - 1, -1, -1))
 
     # ---- input ----------------------------------------------------------- #
     def on_press(self, e):
@@ -652,7 +761,7 @@ class MeowKnight:
             self.vx = max(-lim, min(lim, vx))
             self.vy = max(-lim, min(lim, vy))
             self.set_state("fall")
-            self.play("jump", seq=[6])
+            self.play("jump", seq=[self.char.fall_frame])
         else:
             if self.state == "sleep":
                 self.start_wake()
@@ -685,7 +794,7 @@ class MeowKnight:
         self.state_t += dt
         self.advance(dt)
         self.update_monsters(dt)
-        s = self.scale
+        u = self.u
         st = self.state
 
         if st not in ("sleep", "wake", "held", "fall") and \
@@ -703,7 +812,7 @@ class MeowKnight:
                 self.choose_action()
 
         elif st == "walk":
-            step = 28 * s * dt
+            step = 28 * u * dt
             if abs(self.target_x - self.x) <= step:
                 self.x = self.target_x
                 self.enter_idle()
@@ -718,27 +827,28 @@ class MeowKnight:
                 dx = m.x - self.x
                 if dx:
                     self.facing = 1 if dx > 0 else -1
-                if abs(dx) - m.half_w <= 10 * s:
+                if abs(dx) - m.half_w <= self.reach() * 0.45:
                     self.start_attack()
                 else:
-                    self.x += self.facing * min(48 * s * dt, abs(dx))
+                    self.x += self.facing * min(48 * u * dt, abs(dx))
 
         elif st == "jump":
-            ms = ANIMS["jump"][1] / 1000.0
-            air_start, air_len = 3 * ms, 5 * ms
+            ms = self.char.anims["jump"]["ms"]
+            a, b = self.char.air_frames
+            air_start = sum(ms[:a]) / 1000.0
+            air_len = max(0.05, sum(ms[a:b + 1]) / 1000.0)
             p = (self.state_t - air_start) / air_len
             if 0 <= p <= 1:
-                self.feet_y = self.ground - 4 * 22 * s * p * (1 - p)
+                self.feet_y = self.ground - 4 * 22 * u * p * (1 - p)
                 self.x += self.vx * dt
             else:
                 self.feet_y = self.ground
             if self.anim["done"]:
-                self.vx = 0
                 self.enter_idle()
 
         elif st == "dodge":
             if not self.anim["done"]:
-                self.x += self.facing * 55 * s * dt
+                self.x += self.facing * 55 * u * dt
             else:
                 self.enter_idle()
 
@@ -769,7 +879,7 @@ class MeowKnight:
                 self.enter_idle()
 
         elif st == "sleep":
-            if self.anim["done"]:
+            if self.anim["done"] or (self.char.sleep_loops and self.state_t > 0.8):
                 phase = self.state_t * 1.2
                 zs = "z" * (1 + int(phase) % 3)
                 self.canvas.itemconfig(self.z_id, text=zs)
@@ -808,20 +918,21 @@ class MeowKnight:
         self.canvas.coords(self.img_id, self.half_w - anchor, self.ch - f["h"])
 
         if self.canvas.itemcget(self.z_id, "text"):
-            bob = math.sin(self.state_t * 2.0) * 3 * self.scale / 3
-            zx = self.half_w + 8 * self.scale * self.facing
-            self.canvas.coords(self.z_id, zx, self.ch - f["h"] - 6 * self.scale + bob)
+            bob = math.sin(self.state_t * 2.0) * self.u
+            zx = self.half_w + 8 * self.u * self.facing
+            self.canvas.coords(self.z_id, zx, self.ch - f["h"] - 6 * self.u + bob)
 
         geom = "%dx%d+%d+%d" % (self.cw, self.ch,
                                 int(self.x - self.half_w), int(self.feet_y - self.ch))
         if geom != self.last_geom:
             self.root.geometry(geom)
             self.last_geom = geom
-        self.root.lift()   # stay above slime windows
+        if self.monsters:
+            self.root.lift()   # stay above slime windows
 
     def run(self):
         self.root.mainloop()
 
 
 if __name__ == "__main__":
-    MeowKnight().run()
+    DesktopPet().run()
