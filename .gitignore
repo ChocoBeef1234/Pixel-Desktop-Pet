@@ -1,0 +1,5 @@
+# Sprite pack is licensed for use only, not redistribution - add it locally.
+assets/*
+!assets/.gitkeep
+__pycache__/
+*.pyc
