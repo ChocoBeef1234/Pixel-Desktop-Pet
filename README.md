@@ -1,4 +1,4 @@
-# Meow Knight Desktop Pet
+# Pixel Desktop Pet
 
 A small character that lives on top of your Windows taskbar. It wanders, jumps,
 rolls, naps, and hunts down slimes that drop in from time to time.
