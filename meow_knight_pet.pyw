@@ -162,17 +162,70 @@ def slime_image(colors):
     return img
 
 
-class Slime:
-    def __init__(self, pet, x):
+class Popup:
+    """Floating text (damage numbers, +1, SPLIT!) that rises and fades."""
+    LIFE = 0.8
+
+    def __init__(self, pet, x, y, text, color, size=1.0, rise=28):
         self.pet = pet
-        self.colors = random.choice(SLIME_VARIANTS)
-        self.big = random.random() < 0.25
-        self.hp = 4 if self.big else 2
+        u = pet.u
+        self.x = x + random.uniform(-4, 4) * u
+        self.y0 = y
+        self.rise = rise * u
+        self.drift = random.uniform(-6, 6) * u
+        self.t = 0.0
+        self.gone = False
+        pt = max(9, int((6 + 2.2 * u) * size))
+        font = ("Consolas", pt, "bold")
+        self.w = int(pt * (len(text) + 1) * 1.0) + 8
+        self.h = int(pt * 2.0)
+        self.win = tk.Toplevel(pet.root)
+        make_overlay(self.win)
+        c = tk.Canvas(self.win, width=self.w, height=self.h, bg=KEY,
+                      highlightthickness=0, bd=0)
+        c.pack()
+        cx, cy = self.w / 2, self.h / 2
+        c.create_text(cx + 1, cy + 1, text=text, fill="#140c1c", font=font)
+        c.create_text(cx, cy, text=text, fill=color, font=font)
+        self.last_alpha = None
+        self.update(0)
+
+    def update(self, dt):
+        self.t += dt
+        p = self.t / self.LIFE
+        if p >= 1:
+            self.destroy()
+            return
+        ease = 1 - (1 - p) ** 2
+        x = self.x + self.drift * p
+        y = self.y0 - self.rise * ease
+        self.win.geometry("%dx%d+%d+%d" % (self.w, self.h, int(x - self.w / 2),
+                                           int(y - self.h / 2)))
+        alpha = round(1.0 if p < 0.55 else max(0.0, 1 - (p - 0.55) / 0.45), 2)
+        if alpha != self.last_alpha:
+            self.win.attributes("-alpha", alpha)
+            self.last_alpha = alpha
+
+    def destroy(self):
+        self.gone = True
+        try:
+            self.win.destroy()
+        except tk.TclError:
+            pass
+
+
+class Slime:
+    def __init__(self, pet, x, big=None, colors=None, hp=None, feet_y=None):
+        self.pet = pet
+        self.colors = colors or random.choice(SLIME_VARIANTS)
+        self.big = (random.random() < 0.25) if big is None else big
+        self.hp = hp if hp is not None else (4 if self.big else 2)
         self.x = float(x)
-        self.feet_y = pet.ground - random.uniform(220, 380)  # drops in from above
+        # Normal spawns drop in from above; split children start where told.
+        self.feet_y = feet_y if feet_y is not None else pet.ground - random.uniform(220, 380)
         self.vx = self.vy = 0.0
         self.airborne = True
-        self.landed = False          # becomes True after first touchdown
+        self.landed = feet_y is not None   # split children are targetable at once
         self.crouch = 0.0
         self.squash = 0.0
         self.flash = 0.0
@@ -222,26 +275,53 @@ class Slime:
     def on_click(self, _e):
         self.hit(1 if self.x >= self.pet.x else -1)
 
-    def hit(self, direction):
+    def top_y(self):
+        return self.feet_y - self.body_h
+
+    def hit(self, direction, damage=1, color="#ffffff"):
         if self.dead:
             return
-        self.hp -= 1
+        self.hp -= damage
         self.flash = 0.16
         u = self.pet.u
-        self.vx = direction * 55 * u
-        self.vy = -55 * u
+        push = 1.0 + 0.4 * (damage - 1)
+        self.vx = direction * 55 * u * push
+        self.vy = -55 * u * push
         self.airborne = True
         self.crouch = 0.0
+        self.pet.popup(self.x, self.top_y(), str(damage), color,
+                       size=1.0 + 0.25 * (damage - 1))
         if self.hp <= 0:
             self.die()
+        elif self.big and self.hp <= 2:
+            self.split()
 
     def die(self):
         self.dead = True
         self.pet.on_monster_killed()
+        self.pet.popup(self.x, self.top_y() - 6 * self.pet.u, "+1", "#7dff8a", rise=40)
+        self.burst(14 if self.big else 10)
+
+    def split(self):
+        """Big slime pops into two small 1-HP slimes that jump apart."""
+        self.dead = True
+        u = self.pet.u
+        for direction in (-1, 1):
+            child = Slime(self.pet, self.x + direction * self.half_w * 0.5,
+                          big=False, colors=self.colors, hp=1,
+                          feet_y=min(self.feet_y, self.pet.ground) - 1)
+            child.vx = direction * random.uniform(70, 95) * u
+            child.vy = -random.uniform(110, 140) * u
+            child.flash = 0.1
+            self.pet.add_monster(child)
+        self.pet.popup(self.x, self.top_y() - 4 * u, "SPLIT!", "#8fd8ff", size=0.9)
+        self.burst(8)
+
+    def burst(self, count):
         self.canvas.itemconfig(self.img_id, state="hidden")
         cx, cy = self.cw / 2, self.ch - self.body_h / 2
         colors = [self.colors[1], self.colors[2], self.colors[3], "#ffffff"]
-        for _ in range(14 if self.big else 10):
+        for _ in range(count):
             size = random.choice((1, 1, 2)) * self.px_scale
             ang = random.uniform(math.pi * 1.05, math.pi * 1.95)
             spd = random.uniform(80, 200) * self.pet.u / 3
@@ -381,6 +461,7 @@ class DesktopPet:
         self.drag_hist = []
 
         self.monsters = []
+        self.popups = []
         self.kills = 0
         self.hit_done = True
         self.spawn_timer = random.uniform(*FIRST_SPAWN_S)
@@ -615,9 +696,31 @@ class DesktopPet:
             if abs(x - self.x) > 250:
                 break
             x = random.uniform(left + 80, right - 80)
-        self.monsters.append(Slime(self, x))
+        self.add_monster(Slime(self, x))
         if self.state == "sleep" and self.nap_until:   # casual nap -> wake up
             self.start_wake()
+
+    def add_monster(self, m):
+        self.monsters.append(m)
+
+    def popup(self, x, y, text, color, size=1.0, rise=28):
+        while len(self.popups) >= 15:
+            self.popups.pop(0).destroy()
+        self.popups.append(Popup(self, x, y, text, color, size, rise))
+
+    def toss_impact(self, speed):
+        """Pet landed after being thrown: hurt slimes near the landing spot."""
+        if speed < 500:
+            return
+        damage = 2 if speed > 1400 else 1
+        hit_any = False
+        for m in [m for m in self.monsters if not m.dead]:
+            dx = m.x - self.x
+            if abs(dx) - m.half_w <= 14 * self.u:
+                m.hit(1 if dx >= 0 else -1, damage, color="#ffb347")
+                hit_any = True
+        if hit_any:
+            self.popup(self.x, self.ground - 26 * self.u, "SLAM", "#ffb347", size=0.9)
 
     def on_monster_killed(self):
         self.kills += 1
@@ -631,11 +734,14 @@ class DesktopPet:
                 self.spawn_timer = random.uniform(*SPAWN_EVERY_S)
                 if sum(not m.dead for m in self.monsters) < MAX_MONSTERS:
                     self.spawn_monster()
-        for m in self.monsters:
+        for m in list(self.monsters):
             m.update(dt)
             if not m.gone:
                 m.render()
         self.monsters = [m for m in self.monsters if not m.gone]
+        for p in self.popups:
+            p.update(dt)
+        self.popups = [p for p in self.popups if not p.gone]
 
     def reach(self):
         return self.char.attack_reach * self.s
@@ -869,6 +975,7 @@ class DesktopPet:
                 self.facing = 1 if self.vx > 0 else -1
             if self.feet_y >= self.ground:
                 self.feet_y = self.ground
+                self.toss_impact(math.hypot(self.vx, self.vy))
                 self.vx = self.vy = 0
                 self.set_state("land")
                 n = len(self.frames["jump"])

@@ -9,6 +9,9 @@ rolls, naps, and hunts down slimes that drop in from time to time.
 - Slimes spawn randomly (4 colors, occasional big ones) and your character hunts them
 - Click the character to make it attack; click a slime to squish it yourself
 - Drag the character to pick it up, release to drop or toss it
+- Throw the character at slimes: a hard landing next to one deals damage
+- Big slimes split into two small slimes when they're down to half health
+- Floating damage numbers on every hit and a "+1" on every kill
 - Falls asleep when you're away from the computer, wakes when you return
 - Right-click menu: kill counter, character picker and importer, jump, nap,
   spawn monster, toggle monsters, size, quit
