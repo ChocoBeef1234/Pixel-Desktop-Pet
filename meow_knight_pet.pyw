@@ -49,6 +49,16 @@ FIRST_SPAWN_S = (10, 25)    # first monster arrives soon after launch
 SPAWN_EVERY_S = (45, 150)   # then every so often
 MAX_MONSTERS = 3
 
+# Slimes fighting back
+PET_MAX_HP = 5
+INVULN_S = 1.0           # safe time after taking a hit
+FAINT_S = (6, 9)         # how long the pet stays knocked out
+REGEN_EVERY_S = 20       # +1 HP this often when no slimes are around
+DODGE_CHANCE = 0.35      # chance to roll away from an incoming lunge
+LUNGE_CHANCE = 0.8       # chance a nearby slime's hop is an attack
+GUARD_S = (0.5, 1.1)     # pet's pause between sword swings (gives slimes an opening)
+LUNGE_RANGE = 70         # in movement units (* u)
+
 user32 = ctypes.windll.user32
 kernel32 = ctypes.windll.kernel32
 
@@ -226,6 +236,9 @@ class Slime:
         self.vx = self.vy = 0.0
         self.airborne = True
         self.landed = feet_y is not None   # split children are targetable at once
+        self.attacking = False             # mid-lunge at the pet
+        self.lunge_planned = False
+        self.revenge = False               # was knocked back: lunge right after landing
         self.crouch = 0.0
         self.squash = 0.0
         self.flash = 0.0
@@ -278,19 +291,41 @@ class Slime:
     def top_y(self):
         return self.feet_y - self.body_h
 
+    def lunge(self, dist):
+        """Jump so as to land right on the pet's current spot."""
+        u = self.pet.u
+        vy = 110 * u
+        flight = 2 * vy / 1500.0
+        self.vy = -vy
+        self.vx = dist / flight
+        self.airborne = True
+        self.attacking = True
+        self.pet.incoming_lunge(self)
+
+    def bounce_off(self, direction):
+        u = self.pet.u
+        self.vx = direction * 40 * u
+        self.vy = -60 * u
+        self.airborne = True
+
     def hit(self, direction, damage=1, color="#ffffff"):
         if self.dead:
             return
         self.hp -= damage
         self.flash = 0.16
         u = self.pet.u
+        self.pet.popup(self.x, self.top_y(), str(damage), color,
+                       size=1.0 + 0.25 * (damage - 1))
+        winding_up = self.lunge_planned and self.crouch > 0 and not self.airborne
+        if winding_up and self.hp > 0:
+            return          # committed to its lunge: takes the hit without flinching
         push = 1.0 + 0.4 * (damage - 1)
         self.vx = direction * 55 * u * push
         self.vy = -55 * u * push
         self.airborne = True
         self.crouch = 0.0
-        self.pet.popup(self.x, self.top_y(), str(damage), color,
-                       size=1.0 + 0.25 * (damage - 1))
+        self.attacking = self.lunge_planned = False   # knocked out of its attack
+        self.revenge = True
         if self.hp <= 0:
             self.die()
         elif self.big and self.hp <= 2:
@@ -367,22 +402,36 @@ class Slime:
                 self.landed = True
                 self.vx = self.vy = 0.0
                 self.squash = 0.14
+                if self.attacking:
+                    self.attacking = False
+                    self.pet.slime_landed(self)
+                elif self.revenge:          # shake it off and come right back
+                    self.revenge = False
+                    self.hop_timer = random.uniform(0.2, 0.45)
         elif self.crouch > 0:
             self.crouch -= dt
             if self.crouch <= 0:
                 dist = self.pet.x - self.x
-                if abs(dist) < 700 and random.random() < 0.7:
-                    direction = 1 if dist > 0 else -1     # creep toward the hero
+                if self.lunge_planned and abs(dist) < LUNGE_RANGE * u * 1.3:
+                    self.lunge(dist)
                 else:
-                    direction = random.choice((-1, 1))
-                self.vx = direction * random.uniform(25, 45) * u
-                self.vy = -random.uniform(90, 130) * u
-                self.airborne = True
+                    if abs(dist) < 700 and random.random() < 0.7:
+                        direction = 1 if dist > 0 else -1     # creep toward the hero
+                    else:
+                        direction = random.choice((-1, 1))
+                    self.vx = direction * random.uniform(25, 45) * u
+                    self.vy = -random.uniform(90, 130) * u
+                    self.airborne = True
+                self.lunge_planned = False
         else:
             self.hop_timer -= dt
             if self.hop_timer <= 0:
-                self.crouch = 0.18
-                self.hop_timer = random.uniform(0.9, 2.4)
+                near = abs(self.pet.x - self.x) < LUNGE_RANGE * u
+                self.lunge_planned = (self.pet.fight_back.get() and near
+                                      and random.random() < LUNGE_CHANCE)
+                self.crouch = 0.32 if self.lunge_planned else 0.18  # longer wind-up = tell
+                fighting = near and self.pet.fight_back.get()
+                self.hop_timer = random.uniform(0.4, 0.9) if fighting else random.uniform(0.9, 2.4)
 
         left, _, right, _ = work_area()
         lo, hi = left + self.half_w, right - self.half_w
@@ -427,8 +476,18 @@ class DesktopPet:
         self.img_id = self.canvas.create_image(0, 0, anchor="nw")
         self.z_id = self.canvas.create_text(0, 0, text="", fill="#dfe9ff",
                                             font=("Consolas", 11, "bold"))
+        self.bar_bg = self.canvas.create_rectangle(0, 0, 0, 0, fill="#140c1c",
+                                                   outline="#cfc6e0", state="hidden")
+        self.bar_fg = self.canvas.create_rectangle(0, 0, 0, 0, fill="#5be36b",
+                                                   width=0, state="hidden")
 
         settings = load_settings()
+        self.fight_back = tk.BooleanVar(value=settings.get("fight_back", True))
+        self.hp = PET_MAX_HP
+        self.invuln = 0.0
+        self.regen_t = 0.0
+        self.hp_show_until = 0.0
+        self.faint_until = 0.0
         self.size_name = settings.get("size", DEFAULT_SIZE)
         if self.size_name not in dict(SIZES):
             self.size_name = DEFAULT_SIZE
@@ -562,7 +621,8 @@ class DesktopPet:
         try:
             with open(SETTINGS_FILE, "w", encoding="utf-8") as fh:
                 json.dump({"character": self.char_key, "size": self.size_name,
-                           "monsters": self.monsters_on.get()}, fh, indent=2)
+                           "monsters": self.monsters_on.get(),
+                           "fight_back": self.fight_back.get()}, fh, indent=2)
         except Exception:
             pass
 
@@ -578,6 +638,8 @@ class DesktopPet:
         self.menu.add_command(label="Take a nap", command=self.start_nap)
         self.menu.add_command(label="Spawn a monster", command=self.spawn_monster)
         self.menu.add_checkbutton(label="Monsters appear", variable=self.monsters_on,
+                                  command=self.save_settings)
+        self.menu.add_checkbutton(label="Slimes fight back", variable=self.fight_back,
                                   command=self.save_settings)
         size = tk.Menu(self.menu, tearoff=0)
         for label, _ in SIZES:
@@ -635,6 +697,11 @@ class DesktopPet:
         self.half_w = int(math.ceil(half_w)) + 2
         self.cw = self.half_w * 2
         self.ch = int(max_h + 18 * self.u)
+        idle_h = max(f["h"] for f in self.frames["idle"])
+        self.idle_h = idle_h
+        self.bar_w = max(16, 14 * self.u)
+        self.bar_h = max(3, round(2 * self.u))
+        self.bar_y = self.ch - idle_h - 5 * self.u
         self.canvas.config(width=self.cw, height=self.ch)
         self.last_geom = None
         for m in getattr(self, "monsters", []):
@@ -708,6 +775,53 @@ class DesktopPet:
             self.popups.pop(0).destroy()
         self.popups.append(Popup(self, x, y, text, color, size, rise))
 
+    # ---- getting hurt ---------------------------------------------------- #
+    def incoming_lunge(self, m):
+        if self.state in ("idle", "walk", "hunt", "guard") and random.random() < DODGE_CHANCE:
+            self.facing = -1 if m.x > self.x else 1     # roll away from it
+            self.set_state("dodge")
+            self.play("dodge")
+
+    def slime_landed(self, m):
+        dx = m.x - self.x
+        overlap = abs(dx) <= m.half_w + self.char.body_w * self.s * 0.5
+        on_ground = self.feet_y >= self.ground - 2
+        vulnerable = self.state in ("idle", "walk", "hunt", "attack", "land", "guard")
+        if overlap and on_ground and vulnerable and self.invuln <= 0 \
+                and self.fight_back.get():
+            direction = -1 if dx > 0 else 1
+            m.bounce_off(-direction)
+            self.take_hit(direction)
+
+    def take_hit(self, direction):
+        self.hp -= 1
+        self.invuln = INVULN_S
+        self.hp_show_until = time.monotonic() + 3
+        self.popup(self.x, self.feet_y - self.idle_h - 8 * self.u, "-1", "#ff5a5a")
+        self.canvas.itemconfig(self.z_id, text="")
+        if self.hp <= 0:
+            self.hp = 0
+            self.faint()
+            return
+        self.facing = -direction                       # look at the attacker
+        self.vx = direction * 90 * self.u
+        self.set_state("hurt")
+        self.play("hurt")
+
+    def faint(self):
+        self.vx = 0.0
+        self.feet_y = self.ground
+        self.set_state("fainted")
+        self.play("sleep", loop=self.char.sleep_loops)
+        self.faint_until = time.monotonic() + random.uniform(*FAINT_S)
+
+    def revive(self):
+        self.hp = PET_MAX_HP
+        self.hp_show_until = time.monotonic() + 3
+        self.invuln = INVULN_S
+        self.popup(self.x, self.feet_y - self.idle_h - 8 * self.u, "+HP", "#7dff8a")
+        self.start_wake()
+
     def toss_impact(self, speed):
         """Pet landed after being thrown: hurt slimes near the landing spot."""
         if speed < 500:
@@ -754,6 +868,8 @@ class DesktopPet:
             return
         self.hit_done = True
         for m in self.live_monsters():
+            if m.attacking and m.feet_y < self.ground - 8 * self.u:
+                continue        # sword passes under a slime that's high mid-lunge
             dx = m.x - self.x
             if abs(dx) - m.half_w <= self.reach() and dx * self.facing >= -m.half_w:
                 m.hit(self.facing)
@@ -818,6 +934,8 @@ class DesktopPet:
         self.hit_done = False
 
     def start_nap(self, seconds=None):
+        if seconds is None:          # user went away: a proper rest heals fully
+            self.hp = PET_MAX_HP
         self.feet_y = self.ground
         self.set_state("sleep")
         self.play("sleep", loop=self.char.sleep_loops)
@@ -840,7 +958,7 @@ class DesktopPet:
         self.drag_hist = [(time.perf_counter(), e.x_root, e.y_root)]
 
     def on_drag(self, e):
-        if not self.press:
+        if not self.press or self.state == "fainted":
             return
         if not self.dragging:
             if abs(e.x_root - self.press[0]) + abs(e.y_root - self.press[1]) < 6:
@@ -871,7 +989,7 @@ class DesktopPet:
         else:
             if self.state == "sleep":
                 self.start_wake()
-            elif self.state in ("idle", "walk", "hunt"):
+            elif self.state in ("idle", "walk", "hunt", "guard"):
                 self.start_attack()
         self.press = None
         self.dragging = False
@@ -903,7 +1021,17 @@ class DesktopPet:
         u = self.u
         st = self.state
 
-        if st not in ("sleep", "wake", "held", "fall") and \
+        self.invuln = max(0.0, self.invuln - dt)
+        if self.live_monsters() or st == "fainted" or self.hp >= PET_MAX_HP:
+            self.regen_t = 0.0
+        else:
+            self.regen_t += dt
+            if self.regen_t >= REGEN_EVERY_S:
+                self.regen_t = 0.0
+                self.hp += 1
+                self.hp_show_until = time.monotonic() + 3
+
+        if st not in ("sleep", "wake", "held", "fall", "hurt", "fainted") and \
                 user_idle_seconds() > SLEEP_AFTER_IDLE_S:
             self.start_nap()
             return
@@ -962,9 +1090,22 @@ class DesktopPet:
             self.check_hit()
             if self.anim["done"]:
                 if self.live_monsters():
-                    self.enter_hunt()
+                    self.set_state("guard")          # brief stance before the next swing
+                    self.play("idle", loop=True)
+                    self.timer = random.uniform(*GUARD_S)
                 else:
                     self.enter_idle(1.5, 4.0)
+
+        elif st == "guard":
+            m = self.nearest_monster()
+            if m is None:
+                self.enter_idle(1.0, 3.0)
+            else:
+                if m.x != self.x:
+                    self.facing = 1 if m.x > self.x else -1
+                self.timer -= dt
+                if self.timer <= 0:
+                    self.enter_hunt()
 
         elif st == "fall":
             self.vy += 2200 * dt
@@ -984,6 +1125,20 @@ class DesktopPet:
         elif st == "land":
             if self.anim["done"]:
                 self.enter_idle()
+
+        elif st == "hurt":
+            self.vx *= max(0.0, 1 - 6 * dt)
+            self.x += self.vx * dt
+            if self.anim["done"]:
+                self.vx = 0.0
+                if self.live_monsters():
+                    self.enter_hunt()
+                else:
+                    self.enter_idle(1.0, 3.0)
+
+        elif st == "fainted":
+            if time.monotonic() > self.faint_until:
+                self.revive()
 
         elif st == "sleep":
             if self.anim["done"] or (self.char.sleep_loops and self.state_t > 0.8):
@@ -1029,6 +1184,8 @@ class DesktopPet:
             zx = self.half_w + 8 * self.u * self.facing
             self.canvas.coords(self.z_id, zx, self.ch - f["h"] - 6 * self.u + bob)
 
+        self.render_hp_bar()
+
         geom = "%dx%d+%d+%d" % (self.cw, self.ch,
                                 int(self.x - self.half_w), int(self.feet_y - self.ch))
         if geom != self.last_geom:
@@ -1036,6 +1193,26 @@ class DesktopPet:
             self.last_geom = geom
         if self.monsters:
             self.root.lift()   # stay above slime windows
+
+    def render_hp_bar(self):
+        show = self.fight_back.get() and (
+            self.hp < PET_MAX_HP or self.state == "fainted" or bool(self.live_monsters())
+            or time.monotonic() < self.hp_show_until)
+        if not show:
+            self.canvas.itemconfig(self.bar_bg, state="hidden")
+            self.canvas.itemconfig(self.bar_fg, state="hidden")
+            return
+        x0 = self.half_w - self.bar_w / 2
+        y0 = self.bar_y
+        self.canvas.coords(self.bar_bg, x0 - 1, y0 - 1, x0 + self.bar_w + 1, y0 + self.bar_h + 1)
+        frac = self.hp / float(PET_MAX_HP)
+        color = "#5be36b" if frac > 0.6 else "#f2d548" if frac > 0.3 else "#ff5a5a"
+        self.canvas.itemconfig(self.bar_bg, state="normal")
+        if frac > 0:
+            self.canvas.coords(self.bar_fg, x0, y0, x0 + self.bar_w * frac, y0 + self.bar_h)
+            self.canvas.itemconfig(self.bar_fg, fill=color, state="normal")
+        else:
+            self.canvas.itemconfig(self.bar_fg, state="hidden")
 
     def run(self):
         self.root.mainloop()

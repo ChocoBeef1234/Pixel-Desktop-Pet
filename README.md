@@ -12,6 +12,9 @@ rolls, naps, and hunts down slimes that drop in from time to time.
 - Throw the character at slimes: a hard landing next to one deals damage
 - Big slimes split into two small slimes when they're down to half health
 - Floating damage numbers on every hit and a "+1" on every kill
+- Slimes fight back: they lunge at your character, which takes a hit or rolls
+  out of the way. Run out of HP and it faints, then gets back up a bit later.
+  Turn this off with **Slimes fight back** in the right-click menu.
 - Falls asleep when you're away from the computer, wakes when you return
 - Right-click menu: kill counter, character picker and importer, jump, nap,
   spawn monster, toggle monsters, size, quit
