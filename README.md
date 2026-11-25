@@ -18,9 +18,10 @@ rolls, naps, and hunts down slimes that drop in from time to time.
 - Falls asleep when you're away from the computer, wakes when you return
 - Gets out of the way: hides and pauses while a game, video or slideshow is
   fullscreen, and comes back when you leave it
-- Right-click menu: kill counter, character picker and importer, jump, nap,
-  spawn monster, toggle monsters, size, start with Windows, quit
-- Remembers your character, size, monster settings and total slimes defeated
+- Pixel-art **Settings** window for everything: character, size, nap timer,
+  activity, spawn rate, max slimes, pet HP, start with Windows and more
+- Right-click menu for quick actions: settings, jump, nap, spawn monster, quit
+- Remembers all your settings and total slimes defeated
 - Only one pet runs at a time; if something goes wrong, details go to `error.log`
 
 ## Requirements
@@ -35,8 +36,22 @@ Double-click `meow_knight_pet.pyw`, or:
 pythonw meow_knight_pet.pyw
 ```
 
-Right-click the character and choose **Goodbye** to quit. To have it show up
-every time you log in, tick **Start with Windows** in the same menu.
+Right-click the character and choose **Goodbye** to quit.
+
+## Settings
+Open the Settings window from the right-click menu, or just open
+`meow_knight_pet.pyw` again while the pet is running. Changes apply and save
+right away.
+
+| Tab | What you can change |
+|---|---|
+| Pet | Character (with live preview), import or open the characters folder, size, nap when you're away, activity |
+| Monsters | Monsters on/off, spawn rate, max at once, spawn one now, slimes fight back, pet HP, reset slime counter |
+| System | Start with Windows, hide in fullscreen apps, reset all settings |
+
+## Credits
+The Settings window uses the [Silkscreen](https://github.com/googlefonts/silkscreen)
+font by Jason Kottke, under the SIL Open Font License (`fonts/OFL.txt`).
 
 ## Add your own character
 The pet comes with **Slime Buddy**, but any sprite set can be the pet.

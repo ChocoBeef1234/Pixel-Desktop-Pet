@@ -51,18 +51,25 @@ RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 KEY = "#010203"          # transparent color key
 KEY_RGB = (1, 2, 3)
 TICK_MS = 30
-SLEEP_AFTER_IDLE_S = 180  # user inactivity before the character naps
+AWAY_S = 180             # user inactivity that pauses monster spawns
 
 # On-screen height of the idle pose for each size option.
 SIZES = (("Small", 30), ("Medium", 45), ("Large", 60), ("Huge", 90))
-DEFAULT_SIZE = "Medium"
 
 FIRST_SPAWN_S = (10, 25)    # first monster arrives soon after launch
-SPAWN_EVERY_S = (45, 150)   # then every so often
-MAX_MONSTERS = 3
+SPAWN_RATES = {"Rare": (90, 240), "Normal": (45, 150), "Often": (15, 45)}  # seconds between
+NAP_CHOICES = (0, 1, 3, 5, 10)    # minutes away before it naps; 0 = never
+ACTIVITY = {"Calm": 1.8, "Normal": 1.0, "Playful": 0.5}  # idle-time multiplier
+
+# Everything the Settings window can change (saved in settings.json).
+DEFAULTS = {"character": DEFAULT_CHARACTER, "size": "Medium", "monsters": True,
+            "fight_back": True, "kills": 0, "spawn_rate": "Normal", "max_monsters": 3,
+            "pet_hp": 5, "nap_after_min": 3, "activity": "Normal", "hide_fullscreen": True}
+RANGES = {"max_monsters": (1, 6), "pet_hp": (3, 10), "kills": (0, 10 ** 9)}
+CHOICES = {"size": [s for s, _ in SIZES], "spawn_rate": list(SPAWN_RATES),
+           "nap_after_min": list(NAP_CHOICES), "activity": list(ACTIVITY)}
 
 # Slimes fighting back
-PET_MAX_HP = 5
 INVULN_S = 1.0           # safe time after taking a hit
 FAINT_S = (6, 9)         # how long the pet stays knocked out
 REGEN_EVERY_S = 20       # +1 HP this often when no slimes are around
@@ -126,9 +133,10 @@ def fullscreen_app_active():
 
 def already_running():
     """Holds a named mutex for the life of the process; True if another pet has it."""
-    kernel32.CreateMutexW.restype = ctypes.c_void_p
-    already_running.handle = kernel32.CreateMutexW(None, False, "Local\\" + APP_ID)
-    return kernel32.GetLastError() == 183  # ERROR_ALREADY_EXISTS
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)  # reliable GetLastError
+    k32.CreateMutexW.restype = ctypes.c_void_p
+    already_running.handle = k32.CreateMutexW(None, False, "Local\\" + APP_ID)
+    return ctypes.get_last_error() == 183  # ERROR_ALREADY_EXISTS
 
 
 def startup_command():
@@ -161,15 +169,31 @@ def set_startup(on):
                 pass
 
 
-def log_crash():
+def log_crash(fatal=True):
     try:
         with open(ERROR_LOG, "w", encoding="utf-8") as fh:
             traceback.print_exc(file=fh)
     except OSError:
         pass
-    messagebox.showerror("Desktop Pet stopped",
-                         "Something went wrong and the pet had to stop.\n\n"
-                         "Details were saved to:\n%s" % ERROR_LOG)
+    messagebox.showerror("Desktop Pet stopped" if fatal else "Desktop Pet",
+                         ("Something went wrong and the pet had to stop."
+                          if fatal else "Something went wrong with that action.") +
+                         "\n\nDetails were saved to:\n%s" % ERROR_LOG)
+
+
+SETTINGS_EVENT = "Local\\%s.Settings" % APP_ID
+
+
+def create_settings_event():
+    """A second launch sets this event to ask the running pet to open Settings."""
+    kernel32.CreateEventW.restype = ctypes.c_void_p
+    return kernel32.CreateEventW(None, False, False, SETTINGS_EVENT)
+
+
+def signal_settings_event():
+    kernel32.OpenEventW.restype = ctypes.c_void_p
+    h = kernel32.OpenEventW(0x0002, False, SETTINGS_EVENT)  # EVENT_MODIFY_STATE
+    return bool(h) and bool(kernel32.SetEvent(ctypes.c_void_p(h)))
 
 
 def make_overlay(window):
@@ -197,9 +221,31 @@ def list_characters():
 def load_settings():
     try:
         with open(SETTINGS_FILE, encoding="utf-8") as fh:
-            return json.load(fh)
+            return clean_settings(json.load(fh))
     except Exception:
-        return {}
+        return dict(DEFAULTS)
+
+
+def clean_settings(raw):
+    """settings.json is hand-editable: keep only known keys with sane values."""
+    raw = raw if isinstance(raw, dict) else {}
+    out = {}
+    for k, d in DEFAULTS.items():
+        v = raw.get(k, d)
+        if type(v) is not type(d):          # also stops True sneaking in as 1
+            v = d
+        elif k in RANGES:
+            v = min(RANGES[k][1], max(RANGES[k][0], v))
+        elif k in CHOICES and v not in CHOICES[k]:
+            v = d
+        out[k] = v
+    return out
+
+
+assert clean_settings({"pet_hp": 99, "size": "Giant", "monsters": "yes",
+                       "nap_after_min": True, "x": 1, "kills": 7}) == dict(
+    DEFAULTS, pet_hp=10, kills=7), "clean_settings self-check"
+assert clean_settings(None) == DEFAULTS
 
 
 # --------------------------------------------------------------------------- #
@@ -554,21 +600,21 @@ class DesktopPet:
         self.bar_fg = self.canvas.create_rectangle(0, 0, 0, 0, fill="#5be36b",
                                                    width=0, state="hidden")
 
-        settings = load_settings()
-        self.fight_back = tk.BooleanVar(value=settings.get("fight_back", True))
-        self.hp = PET_MAX_HP
+        # One tk variable per setting, shared by the menu and the Settings window.
+        var_type = {bool: tk.BooleanVar, int: tk.IntVar, str: tk.StringVar}
+        self.v = {k: var_type[type(val)](value=val) for k, val in load_settings().items()}
+        self.settings_win = None
+        self.hp = self.max_hp()
         self.invuln = 0.0
         self.regen_t = 0.0
         self.hp_show_until = 0.0
         self.faint_until = 0.0
-        self.size_name = settings.get("size", DEFAULT_SIZE)
-        if self.size_name not in dict(SIZES):
-            self.size_name = DEFAULT_SIZE
         self.char = None
         self.char_key = None
-        self.char_var = tk.StringVar()
-        self.size_var = tk.StringVar(value=self.size_name)
-        if not self.load_initial_character(settings.get("character")):
+        self.char_var = self.v["character"]
+        self.fight_back = self.v["fight_back"]
+        self.monsters_on = self.v["monsters"]
+        if not self.load_initial_character(self.char_var.get()):
             self.root.destroy()
             raise SystemExit(1)
 
@@ -594,18 +640,22 @@ class DesktopPet:
 
         self.monsters = []
         self.popups = []
-        self.kills = int(settings.get("kills", 0))
         self.hit_done = True
         self.spawn_timer = random.uniform(*FIRST_SPAWN_S)
-        self.monsters_on = tk.BooleanVar(value=settings.get("monsters", True))
         self.startup_on = tk.BooleanVar(value=startup_enabled())
         if self.startup_on.get():
             self.toggle_startup()      # refresh the path in case the folder moved
         self.hidden = False
         self.next_fullscreen_check = 0.0
+        self.settings_event = create_settings_event()
 
         self.build_menu()
         self.build_frames()
+        for var in self.v.values():
+            var.trace_add("write", lambda *_: self.save_settings())
+        self.v["size"].trace_add("write", lambda *_: self.build_frames())
+        self.v["kills"].trace_add("write", lambda *_: self.menu.entryconfig(
+            self.kills_index, label="Slimes defeated: %d" % self.v["kills"].get()))
 
         self.canvas.bind("<ButtonPress-1>", self.on_press)
         self.canvas.bind("<B1-Motion>", self.on_drag)
@@ -653,7 +703,6 @@ class DesktopPet:
         self.char_var.set(key)
         self.build_frames()
         self.enter_idle()
-        self.save_settings()
 
     def import_character(self):
         src = filedialog.askdirectory(parent=self.root,
@@ -697,13 +746,30 @@ class DesktopPet:
 
     def save_settings(self):
         try:
-            with open(SETTINGS_FILE, "w", encoding="utf-8") as fh:
-                json.dump({"character": self.char_key, "size": self.size_name,
-                           "monsters": self.monsters_on.get(),
-                           "fight_back": self.fight_back.get(),
-                           "kills": self.kills}, fh, indent=2)
+            tmp = SETTINGS_FILE + ".tmp"   # write then swap, so a power cut can't blank it
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump({k: v.get() for k, v in self.v.items()}, fh, indent=2)
+            os.replace(tmp, SETTINGS_FILE)
         except Exception:
             pass
+
+    def max_hp(self):
+        return self.v["pet_hp"].get()
+
+    def reset_settings(self):
+        """Back to defaults; keeps the chosen character and the kill count."""
+        for k, d in DEFAULTS.items():
+            if k not in ("character", "kills"):
+                self.v[k].set(d)
+
+    def open_settings(self):
+        if self.settings_win and self.settings_win.winfo_exists():
+            self.settings_win.deiconify()
+            self.settings_win.lift()
+            self.settings_win.focus_force()
+            return
+        from settings_window import SettingsWindow
+        self.settings_win = SettingsWindow(self, [slime_image(c) for c in SLIME_VARIANTS])
 
     def toggle_startup(self):
         try:
@@ -715,8 +781,7 @@ class DesktopPet:
                                  parent=self.root)
 
     def on_crash(self, *_exc):
-        log_crash()
-        self.root.destroy()
+        log_crash(fatal=False)   # a failed click or menu action: report it, keep running
 
     def set_hidden(self, hide):
         if hide == self.hidden:
@@ -731,7 +796,9 @@ class DesktopPet:
     # ---- menu ------------------------------------------------------------ #
     def build_menu(self):
         self.menu = tk.Menu(self.root, tearoff=0)
-        self.menu.add_command(label="Slimes defeated: %d" % self.kills, state="disabled")
+        self.menu.add_command(label="Settings...", command=self.open_settings)
+        self.menu.add_command(label="Slimes defeated: %d" % self.v["kills"].get(),
+                              state="disabled")
         self.kills_index = self.menu.index("end")
         self.menu.add_separator()
         self.char_menu = tk.Menu(self.menu, tearoff=0, postcommand=self.fill_char_menu)
@@ -739,26 +806,26 @@ class DesktopPet:
         self.menu.add_command(label="Jump!", command=lambda: self.start_jump(0))
         self.menu.add_command(label="Take a nap", command=self.start_nap)
         self.menu.add_command(label="Spawn a monster", command=self.spawn_monster)
-        self.menu.add_checkbutton(label="Monsters appear", variable=self.monsters_on,
-                                  command=self.save_settings)
-        self.menu.add_checkbutton(label="Slimes fight back", variable=self.fight_back,
-                                  command=self.save_settings)
+        self.menu.add_checkbutton(label="Monsters appear", variable=self.v["monsters"])
+        self.menu.add_checkbutton(label="Slimes fight back", variable=self.v["fight_back"])
         size = tk.Menu(self.menu, tearoff=0)
         for label, _ in SIZES:
-            size.add_radiobutton(label=label, variable=self.size_var, value=label,
-                                 command=lambda l=label: self.set_size(l))
+            size.add_radiobutton(label=label, variable=self.v["size"], value=label)
         self.menu.add_cascade(label="Size", menu=size)
         self.menu.add_checkbutton(label="Start with Windows", variable=self.startup_on,
                                   command=self.toggle_startup)
         self.menu.add_separator()
         self.menu.add_command(label="Goodbye", command=self.root.destroy)
 
+    def characters(self):
+        """[(folder key, display name)] for menus and the Settings window."""
+        return [(k, read_display_name(os.path.join(CHAR_DIR, k))) for k in list_characters()]
+
     def fill_char_menu(self):
         m = self.char_menu
         m.delete(0, "end")
-        for key in list_characters():
-            m.add_radiobutton(label=read_display_name(os.path.join(CHAR_DIR, key)),
-                              variable=self.char_var, value=key,
+        for key, name in self.characters():
+            m.add_radiobutton(label=name, variable=self.char_var, value=key,
                               command=lambda k=key: self.switch_character(k))
         m.add_separator()
         m.add_command(label="Import character folder...", command=self.import_character)
@@ -771,7 +838,7 @@ class DesktopPet:
     # ---- frames ---------------------------------------------------------- #
     def build_frames(self):
         c = self.char
-        target = dict(SIZES)[self.size_name]
+        target = dict(SIZES)[self.v["size"].get()]
         s = target / float(c.body_h)
         if c.pixel_art and s >= 1:
             s = max(1, round(s))           # whole-number scaling keeps pixels crisp
@@ -811,12 +878,6 @@ class DesktopPet:
         for m in getattr(self, "monsters", []):
             if not m.dead:
                 m.build()
-
-    def set_size(self, label):
-        self.size_name = label
-        self.size_var.set(label)
-        self.build_frames()
-        self.save_settings()
 
     # ---- animation ------------------------------------------------------- #
     def play(self, name, loop=False, seq=None):
@@ -920,7 +981,7 @@ class DesktopPet:
         self.faint_until = time.monotonic() + random.uniform(*FAINT_S)
 
     def revive(self):
-        self.hp = PET_MAX_HP
+        self.hp = self.max_hp()
         self.hp_show_until = time.monotonic() + 3
         self.invuln = INVULN_S
         self.popup(self.x, self.feet_y - self.idle_h - 8 * self.u, "+HP", "#7dff8a")
@@ -941,17 +1002,14 @@ class DesktopPet:
             self.popup(self.x, self.ground - 26 * self.u, "SLAM", "#ffb347", size=0.9)
 
     def on_monster_killed(self):
-        self.kills += 1
-        self.menu.entryconfig(self.kills_index,
-                              label="Slimes defeated: %d" % self.kills)
-        self.save_settings()
+        self.v["kills"].set(self.v["kills"].get() + 1)   # traces update menu + save
 
     def update_monsters(self, dt):
-        if self.monsters_on.get() and user_idle_seconds() < SLEEP_AFTER_IDLE_S:
+        if self.monsters_on.get() and user_idle_seconds() < AWAY_S:
             self.spawn_timer -= dt
             if self.spawn_timer <= 0:
-                self.spawn_timer = random.uniform(*SPAWN_EVERY_S)
-                if sum(not m.dead for m in self.monsters) < MAX_MONSTERS:
+                self.spawn_timer = random.uniform(*SPAWN_RATES[self.v["spawn_rate"].get()])
+                if sum(not m.dead for m in self.monsters) < self.v["max_monsters"].get():
                     self.spawn_monster()
         for m in list(self.monsters):
             m.update(dt)
@@ -987,7 +1045,7 @@ class DesktopPet:
     def enter_idle(self, min_s=2.5, max_s=7.0):
         self.set_state("idle")
         self.play("idle", loop=True)
-        self.timer = random.uniform(min_s, max_s)
+        self.timer = random.uniform(min_s, max_s) * ACTIVITY[self.v["activity"].get()]
         self.feet_y = self.ground
         self.vx = 0.0
         self.canvas.itemconfig(self.z_id, text="")
@@ -1040,7 +1098,7 @@ class DesktopPet:
 
     def start_nap(self, seconds=None):
         if seconds is None:          # user went away: a proper rest heals fully
-            self.hp = PET_MAX_HP
+            self.hp = self.max_hp()
         self.feet_y = self.ground
         self.set_state("sleep")
         self.play("sleep", loop=self.char.sleep_loops)
@@ -1112,12 +1170,18 @@ class DesktopPet:
         self.last_time = now
         if now >= self.next_fullscreen_check:
             self.next_fullscreen_check = now + 1.0
-            self.set_hidden(fullscreen_app_active())
+            self.set_hidden(self.v["hide_fullscreen"].get() and fullscreen_app_active())
+            if kernel32.WaitForSingleObject(ctypes.c_void_p(self.settings_event), 0) == 0:
+                self.open_settings()       # someone opened the app again
         try:
             if not self.hidden:          # paused while a fullscreen app is up
                 self.update(dt)
                 self.render()
         except tk.TclError:
+            return
+        except Exception:    # the main loop is broken: the pet would freeze, so stop
+            log_crash()
+            self.root.destroy()
             return
         self.root.after(TICK_MS, self.tick)
 
@@ -1131,7 +1195,8 @@ class DesktopPet:
         st = self.state
 
         self.invuln = max(0.0, self.invuln - dt)
-        if self.live_monsters() or st == "fainted" or self.hp >= PET_MAX_HP:
+        self.hp = min(self.hp, self.max_hp())          # max HP may have been lowered
+        if self.live_monsters() or st == "fainted" or self.hp >= self.max_hp():
             self.regen_t = 0.0
         else:
             self.regen_t += dt
@@ -1140,8 +1205,9 @@ class DesktopPet:
                 self.hp += 1
                 self.hp_show_until = time.monotonic() + 3
 
-        if st not in ("sleep", "wake", "held", "fall", "hurt", "fainted") and \
-                user_idle_seconds() > SLEEP_AFTER_IDLE_S:
+        nap_after = self.v["nap_after_min"].get() * 60
+        if nap_after and st not in ("sleep", "wake", "held", "fall", "hurt", "fainted") and \
+                user_idle_seconds() > nap_after:
             self.start_nap()
             return
 
@@ -1305,7 +1371,7 @@ class DesktopPet:
 
     def render_hp_bar(self):
         show = self.fight_back.get() and (
-            self.hp < PET_MAX_HP or self.state == "fainted" or bool(self.live_monsters())
+            self.hp < self.max_hp() or self.state == "fainted" or bool(self.live_monsters())
             or time.monotonic() < self.hp_show_until)
         if not show:
             self.canvas.itemconfig(self.bar_bg, state="hidden")
@@ -1314,7 +1380,7 @@ class DesktopPet:
         x0 = self.half_w - self.bar_w / 2
         y0 = self.bar_y
         self.canvas.coords(self.bar_bg, x0 - 1, y0 - 1, x0 + self.bar_w + 1, y0 + self.bar_h + 1)
-        frac = self.hp / float(PET_MAX_HP)
+        frac = self.hp / float(self.max_hp())
         color = "#5be36b" if frac > 0.6 else "#f2d548" if frac > 0.3 else "#ff5a5a"
         self.canvas.itemconfig(self.bar_bg, state="normal")
         if frac > 0:
@@ -1329,9 +1395,10 @@ class DesktopPet:
 
 if __name__ == "__main__":
     if already_running():
-        tk.Tk().withdraw()
-        messagebox.showinfo("Desktop Pet", "Your pet is already running.\n\n"
-                            "Right-click it and choose Goodbye to close it.")
+        if not signal_settings_event():    # running pet opens its Settings window
+            tk.Tk().withdraw()
+            messagebox.showinfo("Desktop Pet", "Your pet is already running.\n\n"
+                                "Right-click it and choose Goodbye to close it.")
         raise SystemExit(0)
     try:
         DesktopPet().run()

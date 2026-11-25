@@ -2,7 +2,7 @@
 characters/*
 !characters/slime_buddy/
 
-settings.json
+settings.json*
 error.log
 __pycache__/
 *.pyc
