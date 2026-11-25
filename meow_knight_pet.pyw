@@ -23,9 +23,18 @@ import shutil
 import sys
 import time
 import tkinter as tk
+import traceback
+import winreg
 from tkinter import filedialog, messagebox
 
-from PIL import Image, ImageOps, ImageTk
+try:
+    from PIL import Image, ImageOps, ImageTk
+except ImportError:      # pythonw has no console, so say it in a window
+    tk.Tk().withdraw()
+    messagebox.showerror("Pillow is missing",
+                         "The desktop pet needs the Pillow library.\n\n"
+                         "Open a terminal and run:\n\n    pip install pillow")
+    raise SystemExit(1)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -34,7 +43,10 @@ from character import (MANIFEST, Character, looks_like_character,  # noqa: E402
 
 CHAR_DIR = os.path.join(HERE, "characters")
 SETTINGS_FILE = os.path.join(HERE, "settings.json")
+ERROR_LOG = os.path.join(HERE, "error.log")
 DEFAULT_CHARACTER = "meow_knight"
+APP_ID = "MeowKnightPet"
+RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 
 KEY = "#010203"          # transparent color key
 KEY_RGB = (1, 2, 3)
@@ -98,6 +110,66 @@ def user_idle_seconds():
     if not user32.GetLastInputInfo(ctypes.byref(lii)):
         return 0.0
     return ((kernel32.GetTickCount() - lii.dwTime) & 0xFFFFFFFF) / 1000.0
+
+
+def fullscreen_app_active():
+    """True while a game, video or slideshow is fullscreen (same check Windows
+    uses to hold back notifications)."""
+    state = ctypes.c_int()
+    try:
+        if ctypes.windll.shell32.SHQueryUserNotificationState(ctypes.byref(state)) != 0:
+            return False
+    except Exception:
+        return False
+    return state.value in (2, 3, 4)  # QUNS_BUSY, RUNNING_D3D_FULL_SCREEN, PRESENTATION_MODE
+
+
+def already_running():
+    """Holds a named mutex for the life of the process; True if another pet has it."""
+    kernel32.CreateMutexW.restype = ctypes.c_void_p
+    already_running.handle = kernel32.CreateMutexW(None, False, "Local\\" + APP_ID)
+    return kernel32.GetLastError() == 183  # ERROR_ALREADY_EXISTS
+
+
+def startup_command():
+    if getattr(sys, "frozen", False):          # packaged .exe
+        return '"%s"' % sys.executable
+    exe = sys.executable
+    windowless = os.path.join(os.path.dirname(exe), "pythonw.exe")
+    if os.path.exists(windowless):
+        exe = windowless
+    return '"%s" "%s"' % (exe, os.path.abspath(__file__))
+
+
+def startup_enabled():
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as k:
+            winreg.QueryValueEx(k, APP_ID)
+        return True
+    except OSError:
+        return False
+
+
+def set_startup(on):
+    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE) as k:
+        if on:
+            winreg.SetValueEx(k, APP_ID, 0, winreg.REG_SZ, startup_command())
+        else:
+            try:
+                winreg.DeleteValue(k, APP_ID)
+            except FileNotFoundError:
+                pass
+
+
+def log_crash():
+    try:
+        with open(ERROR_LOG, "w", encoding="utf-8") as fh:
+            traceback.print_exc(file=fh)
+    except OSError:
+        pass
+    messagebox.showerror("Desktop Pet stopped",
+                         "Something went wrong and the pet had to stop.\n\n"
+                         "Details were saved to:\n%s" % ERROR_LOG)
 
 
 def make_overlay(window):
@@ -469,6 +541,7 @@ class DesktopPet:
         make_dpi_aware()
         self.root = tk.Tk()
         self.root.title("Desktop Pet")
+        self.root.report_callback_exception = self.on_crash
         make_overlay(self.root)
 
         self.canvas = tk.Canvas(self.root, bg=KEY, highlightthickness=0, bd=0)
@@ -521,10 +594,15 @@ class DesktopPet:
 
         self.monsters = []
         self.popups = []
-        self.kills = 0
+        self.kills = int(settings.get("kills", 0))
         self.hit_done = True
         self.spawn_timer = random.uniform(*FIRST_SPAWN_S)
         self.monsters_on = tk.BooleanVar(value=settings.get("monsters", True))
+        self.startup_on = tk.BooleanVar(value=startup_enabled())
+        if self.startup_on.get():
+            self.toggle_startup()      # refresh the path in case the folder moved
+        self.hidden = False
+        self.next_fullscreen_check = 0.0
 
         self.build_menu()
         self.build_frames()
@@ -622,14 +700,38 @@ class DesktopPet:
             with open(SETTINGS_FILE, "w", encoding="utf-8") as fh:
                 json.dump({"character": self.char_key, "size": self.size_name,
                            "monsters": self.monsters_on.get(),
-                           "fight_back": self.fight_back.get()}, fh, indent=2)
+                           "fight_back": self.fight_back.get(),
+                           "kills": self.kills}, fh, indent=2)
         except Exception:
             pass
+
+    def toggle_startup(self):
+        try:
+            set_startup(self.startup_on.get())
+        except OSError as e:
+            self.startup_on.set(startup_enabled())
+            messagebox.showerror("Start with Windows",
+                                 "Couldn't change the startup setting:\n%s" % e,
+                                 parent=self.root)
+
+    def on_crash(self, *_exc):
+        log_crash()
+        self.root.destroy()
+
+    def set_hidden(self, hide):
+        if hide == self.hidden:
+            return
+        self.hidden = hide
+        for w in [self.root] + [m.win for m in self.monsters] + [p.win for p in self.popups]:
+            try:
+                w.withdraw() if hide else w.deiconify()
+            except tk.TclError:
+                pass
 
     # ---- menu ------------------------------------------------------------ #
     def build_menu(self):
         self.menu = tk.Menu(self.root, tearoff=0)
-        self.menu.add_command(label="Slimes defeated: 0", state="disabled")
+        self.menu.add_command(label="Slimes defeated: %d" % self.kills, state="disabled")
         self.kills_index = self.menu.index("end")
         self.menu.add_separator()
         self.char_menu = tk.Menu(self.menu, tearoff=0, postcommand=self.fill_char_menu)
@@ -646,6 +748,8 @@ class DesktopPet:
             size.add_radiobutton(label=label, variable=self.size_var, value=label,
                                  command=lambda l=label: self.set_size(l))
         self.menu.add_cascade(label="Size", menu=size)
+        self.menu.add_checkbutton(label="Start with Windows", variable=self.startup_on,
+                                  command=self.toggle_startup)
         self.menu.add_separator()
         self.menu.add_command(label="Goodbye", command=self.root.destroy)
 
@@ -840,6 +944,7 @@ class DesktopPet:
         self.kills += 1
         self.menu.entryconfig(self.kills_index,
                               label="Slimes defeated: %d" % self.kills)
+        self.save_settings()
 
     def update_monsters(self, dt):
         if self.monsters_on.get() and user_idle_seconds() < SLEEP_AFTER_IDLE_S:
@@ -1005,9 +1110,13 @@ class DesktopPet:
         now = time.perf_counter()
         dt = min(now - self.last_time, 0.1)
         self.last_time = now
+        if now >= self.next_fullscreen_check:
+            self.next_fullscreen_check = now + 1.0
+            self.set_hidden(fullscreen_app_active())
         try:
-            self.update(dt)
-            self.render()
+            if not self.hidden:          # paused while a fullscreen app is up
+                self.update(dt)
+                self.render()
         except tk.TclError:
             return
         self.root.after(TICK_MS, self.tick)
@@ -1219,4 +1328,12 @@ class DesktopPet:
 
 
 if __name__ == "__main__":
-    DesktopPet().run()
+    if already_running():
+        tk.Tk().withdraw()
+        messagebox.showinfo("Desktop Pet", "Your pet is already running.\n\n"
+                            "Right-click it and choose Goodbye to close it.")
+        raise SystemExit(0)
+    try:
+        DesktopPet().run()
+    except Exception:
+        log_crash()

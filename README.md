@@ -16,14 +16,17 @@ rolls, naps, and hunts down slimes that drop in from time to time.
   out of the way. Run out of HP and it faints, then gets back up a bit later.
   Turn this off with **Slimes fight back** in the right-click menu.
 - Falls asleep when you're away from the computer, wakes when you return
+- Gets out of the way: hides and pauses while a game, video or slideshow is
+  fullscreen, and comes back when you leave it
 - Right-click menu: kill counter, character picker and importer, jump, nap,
-  spawn monster, toggle monsters, size, quit
-- Remembers your character, size and monster setting
+  spawn monster, toggle monsters, size, start with Windows, quit
+- Remembers your character, size, monster settings and total slimes defeated
+- Only one pet runs at a time; if something goes wrong, details go to `error.log`
 
 ## Requirements
 - Windows
 - Python 3.10+ with tkinter
-- Pillow: `pip install pillow`
+- Pillow: `pip install -r requirements.txt`
 
 ## Run
 Double-click `meow_knight_pet.pyw`, or:
@@ -32,7 +35,8 @@ Double-click `meow_knight_pet.pyw`, or:
 pythonw meow_knight_pet.pyw
 ```
 
-Right-click the character and choose **Goodbye** to quit.
+Right-click the character and choose **Goodbye** to quit. To have it show up
+every time you log in, tick **Start with Windows** in the same menu.
 
 ## Add your own character
 The pet comes with **Slime Buddy**, but any sprite set can be the pet.
